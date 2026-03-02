@@ -1,231 +1,197 @@
 #include <M5Atom.h>
 #include <Wire.h>
-#include <Adafruit_MCP23X17.h>
-#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
+#include "AppConfig.h"
+#include "AppState.h"
+#include "PrinterComm.h"
 
-Adafruit_MCP23X17 mcp;
-bool mcp_ready = false;
+namespace {
 
-// ====== PLC風プロキシ ======
-// Y: 出力 (Bポート GPB0..7, index=8..15)
-struct YRef {
-  uint8_t idx;
-  YRef(uint8_t i): idx(i) {}
-  YRef& operator=(int v){
-    mcp.digitalWrite(8 + idx, v ? HIGH : LOW);
-    return *this;
+constexpr uint8_t kOledWidth   = 128;
+constexpr uint8_t kOledHeight  = 64;
+constexpr uint8_t kOledAddress = 0x3C;
+constexpr uint8_t kSdaPin      = 25;
+constexpr uint8_t kSclPin      = 21;
+constexpr uint8_t kMaxLineLen  = 21;
+
+Adafruit_SSD1306 display(kOledWidth, kOledHeight, &Wire, -1);
+AppState         appState;
+PrinterComm      printerComm;
+bool             oledReady = false;
+
+String clipText(const String& text, size_t maxLen) {
+  if (text.length() <= maxLen) {
+    return text;
   }
-  operator int() const {
-    return (mcp.digitalRead(8 + idx) == HIGH) ? 1 : 0;
+  if (maxLen <= 3) {
+    return text.substring(0, maxLen);
   }
-};
-
-// X: 入力 (Aポート GPA0..7, index=0..7) ※LOWで1（プルアップ前提）
-struct XRef {
-  uint8_t idx;
-  XRef(uint8_t i): idx(i) {}
-  operator int() const {
-    return (mcp.digitalRead(idx) == LOW) ? 1 : 0;
-  }
-};
-
-inline XRef X(uint8_t i){ return XRef(i); }
-inline YRef Y(uint8_t i){ return YRef(i); }
-
-#define X0 X(0)
-#define X1 X(1)
-#define X2 X(2)
-#define X3 X(3)
-#define X4 X(4)
-#define X5 X(5)
-#define X6 X(6)
-#define X7 X(7)
-
-#define Y0 Y(0)
-#define Y1 Y(1)
-#define Y2 Y(2)
-#define Y3 Y(3)
-#define Y4 Y(4)
-#define Y5 Y(5)
-#define Y6 Y(6)
-#define Y7 Y(7)
-
-// ===== LEDユーティリティ =====
-static const CRGB COL_OFF = CRGB(0,0,0);
-
-void fillAll(const CRGB& c){
-  for(uint8_t y=0;y<5;y++) for(uint8_t x=0;x<5;x++) M5.dis.drawpix(x,y,c);
+  return text.substring(0, maxLen - 3) + "...";
 }
-void setDot(uint8_t x,uint8_t y,const CRGB& c){ if(x<5&&y<5) M5.dis.drawpix(x,y,c); }
 
-void drawX(uint8_t bits){
-  for(uint8_t n=0;n<8;n++){
-    uint8_t col=(n<4)?0:1, row=(n%4);
-    setDot(col,row, (bits>>n)&1 ? CRGB(0,80,0) : CRGB(3,3,3));
+CRGB wifiColor(const AppState& state) {
+  if (state.halted) {
+    return CRGB(80, 0, 0);
   }
+  if (state.wifiStatus == "OK") {
+    return CRGB(0, 80, 0);
+  }
+  if (state.wifiStatus == "CONNECT" || state.wifiStatus == "BOOT") {
+    return CRGB(0, 0, 80);
+  }
+  return CRGB(80, 40, 0);
 }
-void drawY(uint8_t bits){
-  for(uint8_t n=0;n<8;n++){
-    uint8_t col=(n<4)?3:4, row=(n%4);
-    setDot(col,row, (bits>>n)&1 ? CRGB(80,0,0) : CRGB(3,3,3));
+
+CRGB mqttColor(const AppState& state) {
+  if (state.halted || state.mqttStatus == "STOP" ||
+      state.mqttStatus.startsWith("ERR")) {
+    return CRGB(80, 0, 0);
+  }
+  if (state.mqttStatus == "OK") {
+    return CRGB(0, 80, 0);
+  }
+  if (state.mqttStatus == "TRY") {
+    return CRGB(80, 50, 0);
+  }
+  return CRGB(20, 20, 20);
+}
+
+void setDot(uint8_t x, uint8_t y, const CRGB& color) {
+  if (x < 5 && y < 5) {
+    M5.dis.drawpix(x, y, color);
   }
 }
 
-bool try_init_mcp(){
-  if(!mcp.begin_I2C(0x20, &Wire)) return false;
-
-  // Bポート: 出力 (Y)
-  for(uint8_t i=0;i<8;i++){
-    mcp.pinMode(8+i, OUTPUT);
-    mcp.digitalWrite(8+i, LOW);
+int progressPercent(const String& value) {
+  if (!value.endsWith("%")) {
+    return -1;
   }
-  // Aポート: 入力+プルアップ (X)
-  for(uint8_t i=0;i<8;i++){
-    mcp.pinMode(i, INPUT_PULLUP);
-  }
-  return true;
+  String digits = value;
+  digits.replace("%", "");
+  return constrain(digits.toInt(), 0, 100);
 }
 
-static void oledPrintBits8(uint8_t v){
-  for(int i=7;i>=0;i--) display.print((v >> i) & 1);
-}
-
-void setup(){
-  M5.begin(true,false,true);
-  M5.dis.setBrightness(20);
+void renderMatrix(const AppState& state) {
   M5.dis.clear();
 
-  // あなたの環境でI2CスキャンOKだったピン
-  Wire.begin(25,21); // SDA=25, SCL=21
-
-  // ==== OLED初期化 ====
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)){
-    fillAll(CRGB(80,0,0));
-    while(1);
+  const CRGB leftColor  = wifiColor(state);
+  const CRGB rightColor = mqttColor(state);
+  for (uint8_t y = 0; y < 4; ++y) {
+    setDot(0, y, leftColor);
+    setDot(1, y, leftColor);
+    setDot(3, y, rightColor);
+    setDot(4, y, rightColor);
   }
+
+  const bool heartbeatOn = ((millis() / 300) % 2) != 0;
+  for (uint8_t y = 0; y < 4; ++y) {
+    setDot(2, y, heartbeatOn ? CRGB(0, 0, 40) : CRGB(2, 2, 2));
+  }
+
+  const int progress = progressPercent(state.progress);
+  const uint8_t litDots =
+      progress < 0 ? 0 : static_cast<uint8_t>((progress + 19) / 20);
+  for (uint8_t x = 0; x < 5; ++x) {
+    const bool lit = x < litDots;
+    setDot(x, 4, lit ? CRGB(0, 50, 50) : CRGB(2, 2, 2));
+  }
+}
+
+void printLine(const String& text) {
+  display.println(clipText(text, kMaxLineLen));
+}
+
+void renderStartupLog(AppState& state) {
+  if (!oledReady) {
+    return;
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  printLine("Bambu startup");
+
+  const uint8_t visibleLines = 7;
+  const uint8_t start =
+      state.logCount > visibleLines ? state.logCount - visibleLines : 0;
+  for (uint8_t i = start; i < state.logCount; ++i) {
+    printLine(state.logLines[i]);
+  }
+  display.display();
+}
+
+void renderDashboard(AppState& state) {
+  if (!oledReady) {
+    return;
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  printLine("Bambu monitor");
+  printLine("W:" + state.wifiStatus + " " + state.ipAddress);
+  printLine("M:" + state.mqttStatus + " " + state.lastEvent);
+  printLine("B:" + state.bedTemp + " N:" + state.nozzleTemp);
+  printLine("P:" + state.progress + " L:" + state.layer);
+  printLine("S:" + state.printState);
+  printLine("PW:" + state.printerWifi + " SQ:" + state.sequenceId);
+  printLine(state.halted ? "ERR:" + state.errorReason : "EV:" + state.lastEvent);
+  display.display();
+}
+
+void renderState(AppState& state) {
+  renderMatrix(state);
+  if (state.immediateRender != nullptr) {
+    renderStartupLog(state);
+  } else {
+    renderDashboard(state);
+  }
+  state.displayDirty = false;
+}
+
+void initDisplay() {
+  Wire.begin(kSdaPin, kSclPin);
+  oledReady = display.begin(SSD1306_SWITCHCAPVCC, kOledAddress);
+  if (!oledReady) {
+    Serial.println("OLED init failed");
+    return;
+  }
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(WHITE);
-  display.setCursor(0,0);
-  display.println(F("initialising..."));
+  display.setTextWrap(false);
   display.display();
-
-  // ==== MCP認識ループ ====
-  while(true){
-    if(try_init_mcp()){
-      mcp_ready = true;
-      fillAll(CRGB(0,80,0));    // 成功 → 全面緑
-      delay(500);
-      M5.dis.clear();
-
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println(F("MCP23017 OK"));
-      display.display();
-      break;
-    }else{
-      static bool on=false;
-      on=!on;
-      fillAll(on?CRGB(80,0,0):COL_OFF);  // 失敗 → 全面赤点滅
-
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println(F("MCP23017 ERROR"));
-      display.display();
-      delay(500);
-    }
-  }
 }
 
-void loop(){
+}  // namespace
+
+void setup() {
+  M5.begin(true, false, true);
+  M5.dis.setBrightness(20);
+  M5.dis.clear();
+
+  initDisplay();
+
+  appState.appendLog("BOOT");
+  appState.immediateRender = renderState;
+  renderState(appState);
+
+  printerComm.begin(appState);
+
+  appState.immediateRender = nullptr;
+  appState.displayDirty    = true;
+  renderState(appState);
+}
+
+void loop() {
   M5.update();
 
-  // =========================================================
-  // Y0..Y3: 4bitカウンタ（Y0が0ビット目）
-  // 0..9を1秒刻みでカウント、10で0にリセット
-  // =========================================================
-  static uint32_t last_update = 0;
-  static uint8_t counter = 0;
-
-  if (millis() - last_update >= 1000) {
-    last_update = millis();
-    counter++;
-    if (counter >= 10) counter = 0;
+  printerComm.tick(appState);
+  if (appState.displayDirty) {
+    renderState(appState);
   }
 
-  Y0 = (counter >> 0) & 1;
-  Y1 = (counter >> 1) & 1;
-  Y2 = (counter >> 2) & 1;
-  Y3 = (counter >> 3) & 1;
-
-  // =========================================================
-  // === 表示更新（X/Yビット収集）===
-  // =========================================================
-  uint8_t xbits=0, ybits=0;
-  for(uint8_t i=0;i<8;i++){
-    int xi = X(i);        // 入力
-    xbits |= (xi&1) << i;
-    int yi = Y(i);        // 出力状態
-    ybits |= (yi&1) << i;
-  }
-
-  // M5 5x5 LED表示
-  M5.dis.clear();
-  drawX(xbits);
-  drawY(ybits);
-
-  // 中央列: セパレータ＆ハートビート
-  static uint32_t t0=millis();
-  bool blink=((millis()-t0)/300)%2;
-  for(uint8_t r=0;r<4;r++) setDot(2,r, blink?CRGB(0,0,50):CRGB(3,3,3));
-  setDot(0,4,CRGB(0,80,0)); setDot(1,4,CRGB(0,80,0));
-  setDot(3,4,CRGB(80,0,0)); setDot(4,4,CRGB(80,0,0));
-
-  // OLED表示（ゼロサプレスなし＝常に8bit表示）
-  display.clearDisplay();
-  display.setCursor(0,0);
-
-  display.print(F("X="));
-  oledPrintBits8(xbits);
-  display.println();
-
-  display.print(F("Y="));
-  oledPrintBits8(ybits);
-  display.println();
-
-  display.print(F("CNT="));
-  display.println(counter);
-
-  display.print(F("ms="));
-  display.println(millis());
-
-  display.display();
-
-  delay(10);
+  delay(appState.halted ? AppConfig::kHaltedLoopDelayMs
+                        : AppConfig::kActiveLoopDelayMs);
 }
-
-
-namespace AppConfig {
-
-// Pull credentials from AppSecrets into this namespace so all existing
-// code continues to use AppConfig::kWifiSsid etc. without modification.
-using AppSecrets::kWifiSsid;
-using AppSecrets::kWifiPassword;
-using AppSecrets::kPrinterHost;
-using AppSecrets::kPrinterPassword;
-using AppSecrets::kPrinterSerial;
-
-constexpr char     kPrinterUser[] = "bblp";  // Fixed value for Bambu Lab LAN MQTT
-constexpr uint16_t kPrinterPort   = 8883;
-
-constexpr uint32_t kWifiConnectTimeoutMs = 20000;
-constexpr uint8_t  kMqttMaxRetries       = 5;
-constexpr uint32_t kMqttRetryDelayMs     = 5000;
-constexpr uint32_t kActiveLoopDelayMs    = 10;
-constexpr uint32_t kHaltedLoopDelayMs    = 250;
-
-}  // namespace AppConfig

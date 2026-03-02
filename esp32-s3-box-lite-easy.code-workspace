@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../esp32-s3-box-lite-easy"
+		},
+		{
+			"name": "ESP32-bambu-MQTT",
+			"path": "."
+		}
+	],
+	"settings": {}
+}

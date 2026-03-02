@@ -1,5 +1,6 @@
 #include <M5Atom.h>
 #include <Wire.h>
+#include <Adafruit_MCP23X17.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -17,9 +18,49 @@ constexpr uint8_t kSclPin      = 21;
 constexpr uint8_t kMaxLineLen  = 21;
 
 Adafruit_SSD1306 display(kOledWidth, kOledHeight, &Wire, -1);
+Adafruit_MCP23X17 mcp;
 AppState         appState;
 PrinterComm      printerComm;
 bool             oledReady = false;
+bool             mcpReady  = false;
+uint8_t          xBits     = 0;
+uint8_t          yBits     = 0;
+uint8_t          counter   = 0;
+uint32_t         lastCounterUpdateMs = 0;
+uint32_t         lastMcpRetryMs      = 0;
+
+struct YRef {
+  uint8_t idx;
+  explicit YRef(uint8_t i) : idx(i) {}
+
+  YRef& operator=(int value) {
+    if (mcpReady) {
+      mcp.digitalWrite(8 + idx, value ? HIGH : LOW);
+    }
+    return *this;
+  }
+
+  operator int() const {
+    return mcpReady && mcp.digitalRead(8 + idx) == HIGH ? 1 : 0;
+  }
+};
+
+struct XRef {
+  uint8_t idx;
+  explicit XRef(uint8_t i) : idx(i) {}
+
+  operator int() const {
+    return mcpReady && mcp.digitalRead(idx) == LOW ? 1 : 0;
+  }
+};
+
+inline XRef X(uint8_t i) { return XRef(i); }
+inline YRef Y(uint8_t i) { return YRef(i); }
+
+#define Y0 Y(0)
+#define Y1 Y(1)
+#define Y2 Y(2)
+#define Y3 Y(3)
 
 String clipText(const String& text, size_t maxLen) {
   if (text.length() <= maxLen) {
@@ -61,6 +102,64 @@ CRGB mqttColor(const AppState& state) {
 void setDot(uint8_t x, uint8_t y, const CRGB& color) {
   if (x < 5 && y < 5) {
     M5.dis.drawpix(x, y, color);
+  }
+}
+
+bool tryInitMcp() {
+  if (!mcp.begin_I2C(0x20, &Wire)) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < 8; ++i) {
+    mcp.pinMode(8 + i, OUTPUT);
+    mcp.digitalWrite(8 + i, LOW);
+  }
+  for (uint8_t i = 0; i < 8; ++i) {
+    mcp.pinMode(i, INPUT_PULLUP);
+  }
+
+  return true;
+}
+
+void serviceMcpOutputs() {
+  if (!mcpReady) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastCounterUpdateMs >= 1000) {
+    lastCounterUpdateMs = now;
+    counter             = (counter + 1) % 10;
+  }
+
+  Y0 = (counter >> 0) & 1;
+  Y1 = (counter >> 1) & 1;
+  Y2 = (counter >> 2) & 1;
+  Y3 = (counter >> 3) & 1;
+
+  xBits = 0;
+  yBits = 0;
+  for (uint8_t i = 0; i < 8; ++i) {
+    xBits |= (static_cast<uint8_t>(X(i)) & 1U) << i;
+    yBits |= (static_cast<uint8_t>(Y(i)) & 1U) << i;
+  }
+}
+
+void ensureMcpReady() {
+  if (mcpReady) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (lastMcpRetryMs != 0 && now - lastMcpRetryMs < 500) {
+    return;
+  }
+  lastMcpRetryMs = now;
+
+  mcpReady = tryInitMcp();
+  if (mcpReady) {
+    appState.lastEvent    = "MCP READY";
+    appState.displayDirty = true;
   }
 }
 
@@ -131,11 +230,12 @@ void renderDashboard(AppState& state) {
   printLine("Bambu monitor");
   printLine("W:" + state.wifiStatus + " " + state.ipAddress);
   printLine("M:" + state.mqttStatus + " " + state.lastEvent);
+  printLine(String("IO:") + (mcpReady ? "OK " : "WAIT ") + "Y=" + String(yBits, BIN));
   printLine("B:" + state.bedTemp + " N:" + state.nozzleTemp);
   printLine("P:" + state.progress + " L:" + state.layer);
-  printLine("S:" + state.printState);
-  printLine("PW:" + state.printerWifi + " SQ:" + state.sequenceId);
-  printLine(state.halted ? "ERR:" + state.errorReason : "EV:" + state.lastEvent);
+  printLine("S:" + state.printState + " C:" + String(counter));
+  printLine("PW:" + state.printerWifi);
+  printLine(state.halted ? "ERR:" + state.errorReason : "SQ:" + state.sequenceId);
   display.display();
 }
 
@@ -177,6 +277,8 @@ void setup() {
   appState.immediateRender = renderState;
   renderState(appState);
 
+  ensureMcpReady();
+
   printerComm.begin(appState);
 
   appState.immediateRender = nullptr;
@@ -187,6 +289,8 @@ void setup() {
 void loop() {
   M5.update();
 
+  ensureMcpReady();
+  serviceMcpOutputs();
   printerComm.tick(appState);
   if (appState.displayDirty) {
     renderState(appState);

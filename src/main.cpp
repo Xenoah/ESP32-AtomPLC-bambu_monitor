@@ -10,6 +10,7 @@
 
 #include "AppSecrets.h"
 
+// 認証情報から実行時設定へ名前を束ねる。
 namespace AppConfig {
 
 using AppSecrets::kWifiSsid;
@@ -28,6 +29,7 @@ constexpr uint32_t kHaltedLoopDelayMs      = 250;
 
 }  // namespace AppConfig
 
+// 画面表示と通信状態をひとまとめに持つ共有状態。
 struct AppState {
   String wifiStatus   = "BOOT";
   String ipAddress    = "--";
@@ -104,10 +106,12 @@ class PrinterComm {
 
 namespace {
 
+// PubSubClient の数値エラーを簡易ラベルに変換する。
 String mqttErrorLabel(int errorCode) {
   return "ERR " + String(errorCode);
 }
 
+// プリンタの homing_status を表示用の短い文字列へ変換する。
 const char* homingLabel(int status) {
   switch (status) {
     case 0: return "IDLE";
@@ -123,6 +127,7 @@ PrinterComm* PrinterComm::instance_ = nullptr;
 
 PrinterComm::PrinterComm() : mqttClient_(tlsClient_) {}
 
+// Wi-Fi と MQTT の接続準備を行う。
 void PrinterComm::begin(AppState& state) {
   state_    = &state;
   instance_ = this;
@@ -143,6 +148,7 @@ void PrinterComm::begin(AppState& state) {
   setupWiFi(state);
 }
 
+// 通信監視のメイン処理。接続維持と MQTT 受信を担当する。
 void PrinterComm::tick(AppState& state) {
   if (state.halted) {
     return;
@@ -159,6 +165,7 @@ void PrinterComm::tick(AppState& state) {
   }
 }
 
+// C 形式のコールバックからインスタンスメソッドへ渡すための中継。
 void PrinterComm::mqttCallback(char* topic, byte* payload,
                                unsigned int length) {
   if (instance_ != nullptr) {
@@ -166,6 +173,7 @@ void PrinterComm::mqttCallback(char* topic, byte* payload,
   }
 }
 
+// 起動時に Wi-Fi へ接続し、表示状態も更新する。
 void PrinterComm::setupWiFi(AppState& state) {
   state.wifiStatus = "CONNECT";
   state.lastEvent  = "JOIN WIFI";
@@ -195,6 +203,7 @@ void PrinterComm::setupWiFi(AppState& state) {
   requestRender(state);
 }
 
+// MQTT 未接続時のみ再接続を試み、接続成功後に初回状態取得を要求する。
 void PrinterComm::ensureMqtt(AppState& state) {
   if (mqttClient_.connected()) {
     return;
@@ -239,6 +248,7 @@ void PrinterComm::ensureMqtt(AppState& state) {
   setFatalState(state, "MQTT CODE " + String(lastError));
 }
 
+// プリンタから届く push_status を読み取り、画面表示用の状態に反映する。
 void PrinterComm::onMessage(char* topic, byte* payload, unsigned int length) {
   if (state_ == nullptr) {
     return;
@@ -303,6 +313,7 @@ void PrinterComm::onMessage(char* topic, byte* payload, unsigned int length) {
   requestRender(*state_);
 }
 
+// Bambu の全状態スナップショットを要求する。
 void PrinterComm::requestPushAll(AppState& state) {
   JsonDocument doc;
   JsonObject   pushing   = doc["pushing"].to<JsonObject>();
@@ -311,6 +322,7 @@ void PrinterComm::requestPushAll(AppState& state) {
   publishJson(state, doc, "PUSHALL SENT", "PUSHALL FAIL");
 }
 
+// JSON を MQTT publish し、結果を lastEvent に残す。
 bool PrinterComm::publishJson(AppState& state, JsonDocument& doc,
                               const char* okEvent, const char* failEvent) {
   String payload;
@@ -323,6 +335,7 @@ bool PrinterComm::publishJson(AppState& state, JsonDocument& doc,
   return published;
 }
 
+// 復旧不能エラー時に停止状態へ切り替える。
 void PrinterComm::setFatalState(AppState& state, const String& reason) {
   state.mqttStatus  = "STOP";
   state.lastEvent   = "FATAL";
@@ -332,6 +345,7 @@ void PrinterComm::setFatalState(AppState& state, const String& reason) {
   Serial.println("Fatal error: " + reason);
 }
 
+// 起動中は即時描画、本稼働後は dirty フラグだけを立てる。
 void PrinterComm::requestRender(AppState& state) {
   if (state.immediateRender) {
     state.appendLog(state.lastEvent);
@@ -342,6 +356,7 @@ void PrinterComm::requestRender(AppState& state) {
 
 namespace {
 
+// OLED と MCP23017 のハードウェア定数。
 constexpr uint8_t kOledWidth   = 128;
 constexpr uint8_t kOledHeight  = 64;
 constexpr uint8_t kOledAddress = 0x3C;
@@ -357,9 +372,11 @@ PrinterComm      printerComm;
 bool oledReady = false;
 bool mcpReady  = false;
 
+// 取得した I/O 状態を OLED に表示しやすい形で保持する。
 uint8_t xBits = 0;
 uint8_t yBits = 0;
 
+// Y 側は出力ポート。代入演算子で PLC 出力っぽく扱えるようにする。
 struct YRef {
   uint8_t idx;
   explicit YRef(uint8_t i) : idx(i) {}
@@ -376,6 +393,7 @@ struct YRef {
   }
 };
 
+// X 側は入力ポート。読み取り専用の簡易ラッパー。
 struct XRef {
   uint8_t idx;
   explicit XRef(uint8_t i) : idx(i) {}
@@ -406,6 +424,7 @@ inline YRef Y(uint8_t i) { return YRef(i); }
 #define Y6 Y(6)
 #define Y7 Y(7)
 
+// OLED の1行に収まる長さへ丸める。
 String clipText(const String& text, size_t maxLen) {
   if (text.length() <= maxLen) {
     return text;
@@ -416,12 +435,14 @@ String clipText(const String& text, size_t maxLen) {
   return text.substring(0, maxLen - 3) + "...";
 }
 
+// Atom の 5x5 LED マトリクスに安全に描画する。
 void setDot(uint8_t x, uint8_t y, const CRGB& color) {
   if (x < 5 && y < 5) {
     M5.dis.drawpix(x, y, color);
   }
 }
 
+// MCP23017 を初期化し、前半を入力・後半を出力として使う。
 bool tryInitMcp() {
   if (!mcp.begin_I2C(0x20, &Wire)) {
     return false;
@@ -437,6 +458,7 @@ bool tryInitMcp() {
   return true;
 }
 
+// 現在の固定出力を PLC 側へ反映する。
 void applyCurrentOutputs() {
   if (!mcpReady) {
     return;
@@ -448,6 +470,7 @@ void applyCurrentOutputs() {
   Y3 = 0;
 }
 
+// MCP の入力/出力状態をビット列として読み直す。
 void sampleMcpState() {
   xBits = 0;
   yBits = 0;
@@ -461,6 +484,7 @@ void sampleMcpState() {
   }
 }
 
+// Wi-Fi 状態を LED 色へ変換する。
 CRGB wifiColor(const AppState& state) {
   if (state.halted) {
     return CRGB(80, 0, 0);
@@ -474,6 +498,7 @@ CRGB wifiColor(const AppState& state) {
   return CRGB(80, 40, 0);
 }
 
+// MQTT 状態を LED 色へ変換する。
 CRGB mqttColor(const AppState& state) {
   if (state.halted || state.mqttStatus == "STOP" ||
       state.mqttStatus.startsWith("ERR")) {
@@ -488,6 +513,7 @@ CRGB mqttColor(const AppState& state) {
   return CRGB(20, 20, 20);
 }
 
+// "85%" のような文字列を数値へ戻す。
 int progressPercent(const String& value) {
   if (!value.endsWith("%")) {
     return -1;
@@ -497,6 +523,7 @@ int progressPercent(const String& value) {
   return constrain(digits.toInt(), 0, 100);
 }
 
+// 5x5 LED に Wi-Fi / MQTT / heartbeat / 進捗を表示する。
 void renderMatrix(const AppState& state) {
   M5.dis.clear();
 
@@ -526,6 +553,7 @@ void printLine(const String& text) {
   display.println(clipText(text, kMaxLineLen));
 }
 
+// 起動中だけ表示する簡易ログ画面。
 void renderStartupLog(AppState& state) {
   if (!oledReady) {
     return;
@@ -544,6 +572,7 @@ void renderStartupLog(AppState& state) {
   display.display();
 }
 
+// 通常運転時のダッシュボード画面。
 void renderDashboard(AppState& state) {
   if (!oledReady) {
     return;
@@ -563,6 +592,7 @@ void renderDashboard(AppState& state) {
   display.display();
 }
 
+// LED マトリクスと OLED をまとめて再描画する。
 void renderState(AppState& state) {
   renderMatrix(state);
   if (state.immediateRender != nullptr) {
@@ -573,6 +603,7 @@ void renderState(AppState& state) {
   state.displayDirty = false;
 }
 
+// OLED を初期化する。
 void initDisplay() {
   Wire.begin(kSdaPin, kSclPin);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, kOledAddress);
@@ -588,6 +619,7 @@ void initDisplay() {
   display.display();
 }
 
+// MCP を初期化し、状態表示を更新する。
 void initMcp() {
   mcpReady = tryInitMcp();
   if (!mcpReady) {
@@ -601,6 +633,7 @@ void initMcp() {
 
 }  // namespace
 
+// 起動時に表示系と通信系を順番に立ち上げる。
 void setup() {
   M5.begin(true, false, true);
   M5.dis.setBrightness(20);
@@ -620,6 +653,7 @@ void setup() {
   renderState(appState);
 }
 
+// 周期処理。I/O 更新、通信処理、必要時のみ再描画を行う。
 void loop() {
   M5.update();
 

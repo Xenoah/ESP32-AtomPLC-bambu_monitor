@@ -74,6 +74,16 @@ inline String formatPercent(int value) {
   return String(value) + "%";
 }
 
+// 共有状態への読み取り窓口。
+AppState& appStateRef();
+const String& currentPrintState();
+const String& currentWifiStatus();
+const String& currentMqttStatus();
+const String& currentLastEvent();
+const String& currentProgress();
+const String& currentLayer();
+bool isAppHalted();
+
 class PrinterComm {
  public:
   PrinterComm();
@@ -360,9 +370,19 @@ namespace {
 constexpr uint8_t kOledWidth   = 128;
 constexpr uint8_t kOledHeight  = 64;
 constexpr uint8_t kOledAddress = 0x3C;
-constexpr uint8_t kSdaPin      = 25;
-constexpr uint8_t kSclPin      = 21;
+constexpr uint8_t kMcpAddress  = 0x20;
 constexpr uint8_t kMaxLineLen  = 21;
+
+struct I2CPinPair {
+  uint8_t sda;
+  uint8_t scl;
+};
+
+// M5 ATOM の Grove 標準を優先しつつ、従来配線もフォールバックで試す。
+constexpr I2CPinPair kI2cPinCandidates[] = {
+    {26, 32},
+    {25, 21},
+};
 
 Adafruit_SSD1306 display(kOledWidth, kOledHeight, &Wire, -1);
 Adafruit_MCP23X17 mcp;
@@ -371,10 +391,48 @@ PrinterComm      printerComm;
 
 bool oledReady = false;
 bool mcpReady  = false;
+uint8_t activeSdaPin = kI2cPinCandidates[0].sda;
+uint8_t activeSclPin = kI2cPinCandidates[0].scl;
 
 // 取得した I/O 状態を OLED に表示しやすい形で保持する。
 uint8_t xBits = 0;
 uint8_t yBits = 0;
+
+}  // namespace
+
+AppState& appStateRef() {
+  return appState;
+}
+
+const String& currentPrintState() {
+  return appState.printState;
+}
+
+const String& currentWifiStatus() {
+  return appState.wifiStatus;
+}
+
+const String& currentMqttStatus() {
+  return appState.mqttStatus;
+}
+
+const String& currentLastEvent() {
+  return appState.lastEvent;
+}
+
+const String& currentProgress() {
+  return appState.progress;
+}
+
+const String& currentLayer() {
+  return appState.layer;
+}
+
+bool isAppHalted() {
+  return appState.halted;
+}
+
+namespace {
 
 // Y 側は出力ポート。代入演算子で PLC 出力っぽく扱えるようにする。
 struct YRef {
@@ -444,7 +502,7 @@ void setDot(uint8_t x, uint8_t y, const CRGB& color) {
 
 // MCP23017 を初期化し、前半を入力・後半を出力として使う。
 bool tryInitMcp() {
-  if (!mcp.begin_I2C(0x20, &Wire)) {
+  if (!mcp.begin_I2C(kMcpAddress, &Wire)) {
     return false;
   }
 
@@ -458,16 +516,42 @@ bool tryInitMcp() {
   return true;
 }
 
+bool i2cDevicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+// 配線候補を順番に試し、応答がある I2C バスを選ぶ。
+void initI2cBus() {
+  for (const I2CPinPair& candidate : kI2cPinCandidates) {
+    Wire.end();
+    Wire.begin(candidate.sda, candidate.scl);
+    delay(10);
+
+    if (i2cDevicePresent(kOledAddress) || i2cDevicePresent(kMcpAddress)) {
+      activeSdaPin = candidate.sda;
+      activeSclPin = candidate.scl;
+      Serial.printf("I2C detected on SDA=%u SCL=%u\n", activeSdaPin,
+                    activeSclPin);
+      return;
+    }
+  }
+
+  activeSdaPin = kI2cPinCandidates[0].sda;
+  activeSclPin = kI2cPinCandidates[0].scl;
+  Wire.end();
+  Wire.begin(activeSdaPin, activeSclPin);
+  Serial.printf("I2C device not detected, fallback to SDA=%u SCL=%u\n",
+                activeSdaPin, activeSclPin);
+}
+
 // 現在の固定出力を PLC 側へ反映する。
 void applyCurrentOutputs() {
   if (!mcpReady) {
     return;
   }
 
-  Y0 = 0;
-  Y1 = 1;
-  Y2 = 0;
-  Y3 = 0;
+
 }
 
 // MCP の入力/出力状態をビット列として読み直す。
@@ -605,7 +689,6 @@ void renderState(AppState& state) {
 
 // OLED を初期化する。
 void initDisplay() {
-  Wire.begin(kSdaPin, kSclPin);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, kOledAddress);
   if (!oledReady) {
     Serial.println("OLED init failed");
@@ -639,6 +722,7 @@ void setup() {
   M5.dis.setBrightness(20);
   M5.dis.clear();
 
+  initI2cBus();
   initDisplay();
 
   appState.appendLog("BOOT");
@@ -663,6 +747,12 @@ void loop() {
   if (appState.displayDirty) {
     renderState(appState);
   }
+
+  const String& printState = currentPrintState();
+  Y0 = (printState == "RUNNING")||((printState == "FINSH")&&(millis()%1000)>500)||((printState == "PAUSE")&&(millis()%1000)>500);
+  Y1 = (printState == "IDLE")||(printState == "FINISH")||(printState == "PAUSE");
+  Y2 = (printState == "FAILED");
+  Y3 = 0;
 
   delay(appState.halted ? AppConfig::kHaltedLoopDelayMs
                         : AppConfig::kActiveLoopDelayMs);
